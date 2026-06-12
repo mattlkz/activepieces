@@ -1,20 +1,22 @@
 # Chat Module
 
 ## Summary
-A platform-level AI chat assistant that lets users interact with an LLM to manage their Activepieces projects through natural language. The chat connects to the platform's configured AI provider, streams responses via a custom WebSocket chunk reducer, and exposes Activepieces resources (flows, tables, connections, runs) as callable tools through the project's MCP server. Conversations are persisted per-user with support for message compaction, file attachments, multi-project context switching, plan approval for multi-step operations, and a tool approval gate for destructive operations.
+A platform-level AI chat assistant that lets users interact with an LLM to manage their Activepieces projects through natural language. The chat connects to the platform's configured AI provider, streams responses via a custom WebSocket chunk reducer, and exposes Activepieces resources (flows, tables, connections, runs) as callable tools through the project's MCP server. Conversations are persisted per-user with support for message compaction, file attachments, multi-project context switching, two-phase (discovery/build) tool gating, and an action-preview gate for ad-hoc write actions. The full tool-call/tool-result history of every turn is persisted (all AI-SDK steps, not just the last), so the agent remembers what it already did within a conversation and does not re-run tools. Inputs are gathered conversationally through connection pickers and multi-question cards during discovery; once understood, the agent builds directly with no separate approval step (flow construction, testing, and publishing are not gated).
 
 ## Key Files
 - `packages/server/api/src/app/ee/chat/chat.module.ts` — module registration with `chatEnabled` plan gate
 - `packages/server/api/src/app/ee/chat/chat-controller.ts` — HTTP endpoints (conversations CRUD, messages, tool approvals)
 - `packages/server/api/src/app/ee/chat/chat-service.ts` — core business logic (conversation management, message streaming)
 - `packages/server/api/src/app/ee/chat/chat-conversation-entity.ts` — ChatConversation TypeORM entity
+- `packages/server/api/src/app/ee/chat/chat-helpers.ts` — provider/tier resolution, project access, conversation fetch/lock
+- `packages/server/api/src/app/ee/chat/chat-history-hygiene.ts` — collapses stale tool outputs in history to control context dilution
+- `packages/shared/src/lib/ee/chat/tool-phases.ts` — two-phase (discovery/build) denylist-based tool gating; shared by API and worker
 - `packages/server/api/src/app/ee/chat/chat-model-factory.ts` — creates AI SDK `LanguageModel` from provider config (OpenAI, Anthropic, Google, Azure, Bedrock, Cloudflare, Custom)
 - `packages/server/api/src/app/ee/chat/chat-compaction.ts` — long-conversation context management via summarization
 - `packages/server/api/src/app/ee/chat/chat-approval-gate.ts` — Redis pub/sub gate for tool execution approval (5-min timeout); uses atomic SET NX for first-decision-wins semantics; also stores per-conversation cancel signals with a 10-min TTL; manages server-side connection store (available/selected connections per conversation+piece) and pending gate persistence for refresh resilience
 - `packages/server/api/src/app/ee/chat/chat-file-utils.ts` — file attachment processing (base64, MIME validation, 10MB limit)
 - `packages/server/api/src/app/ee/chat/tools/chat-tools.ts` — cross-project tool execution (auth discovery, action execution with server-managed connections, resource listing); `ap_execute_action` auto-fills connectionExternalId and projectId from Redis connection store — the LLM never sees credential IDs
 - `packages/shared/src/lib/ee/chat/tool-classification.ts` — consolidated tool classification predicates (approval-required, action preview risk) as single source of truth; imported by both API server and worker
-- `packages/server/api/src/app/ee/chat/chat-prepare-step.ts` — per-step thinking-budget / tool-filter overrides via AI SDK `prepareStep`
 - `packages/server/api/src/app/ee/chat/mcp/chat-mcp.ts` — connects to Activepieces MCP server for project-scoped tools with approval wrapping
 - `packages/server/api/src/app/ee/chat/history/chat-history.ts` — reconstructs chat history from AI SDK `ModelMessage` format
 - `packages/server/api/src/app/ee/chat/prompt/chat-prompt.ts` — builds system prompt from markdown templates in `src/assets/prompts/`
@@ -23,11 +25,11 @@ A platform-level AI chat assistant that lets users interact with an LLM to manag
 - `packages/web/src/app/routes/chat-with-ai/index.tsx` — main chat page component
 - `packages/web/src/app/routes/chat-with-ai/ai-chat-box.tsx` — chat interface with provider check, message streaming, Zustand store provider; manages suggestion prefill via counter-based key remount on empty-state suggestion clicks
 - `packages/web/src/app/routes/chat-with-ai/conversation-list.tsx` — conversation history sidebar
-- `packages/web/src/app/routes/chat-with-ai/components/` — sub-components (input, assistant message, user message, thinking details panel, plan progress card, approval forms, connection picker, action-preview-card, action-receipt-card); `chat-empty-state.tsx` renders a personalized greeting with the user's first name, horizontal flow cards with images, and a vertical text-suggestion list with lazy-loaded icons
+- `packages/web/src/app/routes/chat-with-ai/components/` — sub-components (input, assistant message, user message, thinking details panel, approval forms, connection picker, multi-question card, action-preview-card, action-receipt-card); `chat-empty-state.tsx` renders a personalized greeting with the user's first name, horizontal flow cards with images, and a vertical text-suggestion list with lazy-loaded icons
 - `packages/web/src/features/chat/lib/chat-api.ts` — API client for `/v1/chat/*` endpoints
 - `packages/web/src/features/chat/lib/chat-store.ts` — Zustand store for interaction state (approvals, plan progress, display cards, thinking panel)
 - `packages/web/src/features/chat/lib/chat-store-context.tsx` — React context provider and `useChatStoreContext` selector hook
-- `packages/web/src/features/chat/lib/use-chat.ts` — `useAgentChat()` hook managing message state (persisted, optimistic, streaming) and polling fallback
+- `packages/web/src/features/chat/lib/use-chat.ts` — `useAgentChat()` hook managing message state (persisted, optimistic, streaming); stale-check only reconciles when the server reports the conversation is no longer STREAMING
 - `packages/web/src/features/chat/lib/chunk-reducer.ts` — pure streaming state machine that accumulates `UIMessageChunk` events into a `ChatUIMessage`
 - `packages/web/src/features/chat/lib/use-streaming-reducer.ts` — WebSocket-driven streaming lifecycle hook; buffers chunks and throttles React re-renders
 - `packages/web/src/features/chat/lib/chat-types.ts` — frontend type definitions, tool output parsing, display/hidden tool name sets, `CreditsWarning` type
@@ -45,17 +47,17 @@ A platform-level AI chat assistant that lets users interact with an LLM to manag
 ## Domain Terms
 - **ChatConversation** — a persisted conversation between a user and the AI assistant, scoped to a platform and user; optionally scoped to a project for tool access
 - **Message compaction** — when a conversation exceeds a token threshold, older messages are summarized by the LLM and replaced with a summary to keep context within the model's window
-- **Tool approval gate** — a Redis pub/sub mechanism that pauses destructive tool executions (delete, test, publish) until the user explicitly approves or denies in the UI; times out after 5 minutes
-- **Plan approval** — a multi-step approval mechanism where the agent presents a plan via `ap_request_plan_approval` (includes a required `mode` field: `one_time` or `recurring`), the user approves or rejects, and approved plans execute with progress tracking
-- **Local tools** — chat-specific tools not part of MCP: `ap_set_session_title`, `ap_select_project`, `ap_execute_action`, `ap_list_across_projects`, `ap_request_plan_approval`
+- **Tool approval gate** — a Redis pub/sub mechanism that blocks on user input until the user responds in the UI; times out after 5 minutes. Used to wait on display-tool cards (connection picker, multi-question card, project picker) and the ad-hoc action-preview gate. Flow build/test/publish and MCP tools are NOT gated — they execute directly
+- **Two-phase toolset gating** — the agent runs in a `discovery` or `build` phase (`tool-phases.ts`); a denylist hides build-only tools during discovery to shrink the tool surface. `ap_set_phase` flips the phase; the gate auto-widens if a build/manage tool fires so the agent can't get stuck
+- **Local tools** — chat-specific tools not part of MCP: `ap_set_session_title`, `ap_select_project`, `ap_deselect_project`, `ap_execute_action`, `ap_list_across_projects`, `ap_explore_data`, `ap_load_guide`, `ap_set_phase`
 - **Display tools** — tools that render interactive UI cards: `ap_show_connection_required`, `ap_show_connection_picker`, `ap_show_project_picker`, `ap_show_questions`, `ap_show_quick_replies`
-- **MCP tools** — project-scoped tools loaded from the Activepieces MCP server when a project is selected; destructive ones are wrapped with the approval gate
+- **MCP tools** — project-scoped tools loaded from the Activepieces MCP server when a project is selected; wrapped only with a per-call execution timeout (`withToolTimeouts`) — the chat no longer gates them behind approval
 - **Tool call UX metadata** — optional `title` (2-4 word chip label) and `description` (first-person conversational sentence) stored on `PersistedToolCallPart`; description is sourced from the preceding `ap_update_thinking_status` text with `input.description` as fallback, rendered above the tool card chip
 - **Server-managed connections** — connection externalIds are never exposed to the LLM; `ap_discover_action_auth` stores available connections in Redis (with `grantedScopes` and `requiredScopes` for scope-aware selection), `ap_show_connection_picker` stores the user's selection, and `ap_execute_action` auto-fills the connection from the store
 - **Action preview gate** — write/destructive actions show a preview card (parameters, connection) before execution; classification uses a hybrid AI-driven (`needsConfirmation` flag) + server hard-floor (name pattern matching) approach; persisted as pending gate in Redis for refresh resilience
-- **Action receipt** — server-rendered card showing action result (status, output, connection badge, timestamp); emitted as `ACTION_RECEIPT` event and persisted as `PersistedChatPartType.ACTION_RECEIPT` in conversation history
+- **Action receipt** — server-rendered card showing action result (status, output, connection badge, timestamp); emitted as `ACTION_RECEIPT` event and persisted as `PersistedChatPartType.ACTION_RECEIPT` in conversation history; receipt cards visually split the thinking accordion so each action's thinking section appears immediately above its receipt card
 - **Pending gate persistence** — when a display tool or action preview blocks on approval, gate metadata is stored in Redis so the frontend can re-show the card after page refresh; cleared automatically when the gate resolves
-- **Stream reconnection** — when loading a STREAMING conversation (e.g. after refresh), the frontend extracts the last assistant message from history as the streaming message's initial content, calls `getPendingGate` to inject synthetic display-tool parts for pending gates, then calls `startStream`; a socket `connect` handler re-registers the chunk listener and resets the stale-check timer on reconnect
+- **Stream reconnection** — when loading a STREAMING conversation (e.g. after refresh), the frontend extracts the last assistant message from history as the streaming message's initial content, calls `getPendingGate` to inject synthetic display-tool parts for pending gates, then calls `startStream`; a socket `connect` handler re-registers the chunk listener and resets the stale-check timer on reconnect; the periodic stale-check calls `GET /conversations/:id` and only reconciles when the server's status is no longer STREAMING, so long tool executions (>15s) are not incorrectly torn down
 - **Run ID event filtering** — each agent run gets a unique `runId` (generated in the controller, included in job data, threaded through all websocket events); the frontend's event handler filters by `runId` to prevent stale FINISHED/ERROR events from old runs from killing new streams; combined with a generation counter that guards against stale async reconcile callbacks
 - **AI provider** — a platform-configured LLM provider with an `enabledForChat` flag; the chat resolves the first enabled provider and its default model
 - **Streaming cancel** — cancel keys are run-scoped (`chat-cancel:{conversationId}:{runId}`) so each worker only checks its own key; a 3-second periodic timer polls the Redis key so cancellation fires within 3 seconds regardless of step boundaries; partial messages (from completed steps via `onAbort` callback) are saved to preserve context for resume; when a new message arrives while STREAMING, the controller reads the active runId, cancels that specific run, and resets status to IDLE before queuing the new job
@@ -77,14 +79,17 @@ A platform-level AI chat assistant that lets users interact with an LLM to manag
 - `updateConversation()` — updates title and/or modelName
 - `deleteConversation()` — deletes a conversation after ownership check; blocked while status is STREAMING
 - `getMessages()` — reconstructs `ChatHistoryMessage[]` from stored `ModelMessage[]`
-- `sendMessage()` — the main streaming flow: resolves provider, connects MCP, builds prompt, runs `streamText()` with `stopWhen: isLoopFinished()` (no hard step cap), `prepareStep` (hides plan approval tool after approval), `experimental_repairToolCall` (auto-fixes malformed JSON), and `experimental_onToolCallFinish` (per-tool logging); retries event delivery with exponential backoff; tools have a 5-minute per-call timeout with AbortSignal propagation; persists assistant response on completion
+- `sendMessage()` — the main streaming flow: resolves provider, connects MCP, builds prompt, runs `streamText()` with `stopWhen: isLoopFinished()` (no hard step cap), `prepareStep` (narrows the active toolset to the current discovery/build phase), `experimental_repairToolCall` (auto-fixes malformed JSON), and `experimental_onToolCallFinish` (per-tool logging); retries event delivery with exponential backoff; tools have a 5-minute per-call timeout with AbortSignal propagation; persists assistant response on completion
 
 ## Local Tools
 - `ap_set_session_title` — auto-names the conversation after the first exchange
 - `ap_select_project` — switches project context (scopes MCP tools to that project)
 - `ap_execute_action` — executes a single piece action ad-hoc (e.g. "check my inbox"); connections are managed server-side (the LLM never sees externalIds); write/destructive actions trigger an action preview gate before execution; emits `ACTION_RECEIPT` events after completion
 - `ap_list_across_projects` — lists flows, tables, runs, or connections across all user-accessible projects
-- `ap_request_plan_approval` — presents a multi-step plan to the user for approval before executing destructive or write operations
+- `ap_deselect_project` — clears the selected project context
+- `ap_explore_data` — read-only exploration of the user's data (sheets, channels, columns) to build understanding during discovery; never configures the automation
+- `ap_load_guide` — loads an on-demand prompt guide (e.g. `build_flow`) so guidance is only in context when needed
+- `ap_set_phase` — flips the agent between the `discovery` and `build` tool phases
 
 ## Display Tools
 - `ap_show_connection_required` — prompts the user to connect a service
@@ -118,7 +123,7 @@ All chat endpoints require `PrincipalType.USER` authentication at the platform l
 2. Service resolves AI provider, connects MCP client, builds system prompt with project list
 3. If conversation is long, compaction summarizes older messages
 4. `streamText()` streams the LLM response with local tools + display tools + MCP tools available
-5. Destructive MCP tool calls pause and emit an approval request to the UI via the stream
-6. User approves/denies via `POST /tool-approvals/:gateId`, unblocking the gate via Redis pub/sub
+5. Display-tool cards (connection picker, questions) and ad-hoc write actions (`ap_execute_action` previews) pause and emit a gate request to the UI via the stream; flow build/test/publish run without gating
+6. User responds via `POST /tool-approvals/:gateId`, unblocking the gate via Redis pub/sub
 7. On stream completion, assistant messages are appended to the stored conversation
 8. On cloud, `chatAnalyticsTelemetry` pushes the updated conversation to `console.activepieces.com` for monitoring (fire-and-forget, skipped when `CONSOLE_API_SECRET_KEY` is unset); messages are sourced from uiMessages when available, falling back to reconstruction from raw ModelMessage[] for older conversations
